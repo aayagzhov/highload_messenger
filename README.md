@@ -352,6 +352,18 @@ Media RPS upload peak: 3 472 × 4 = 13 889 RPS
 
 **TTL (Time To Live)** — время жизни DNS-ответа в кэше. TTL=60 сек → после сбоя ДЦ клиенты получат новый IP не позднее чем через 60 сек (плюс время health-check).
 
+**Откуда взяты имена компонентов** — краткая карта; подробнее в §3.1 и §3.2:
+
+| Имя | Паттерн | Источник / обоснование |
+|-----|---------|------------------------|
+| `auth.max.ru` | Auth-микросервис на отдельном домене | [\[6\]](#источники-3-6) — декомпозиция мессенджера; изоляция SMS/rate limit |
+| `msg.max.ru` | Real-time messaging + WebSocket | [\[6\]](#источники-3-6); sticky WS требует отдельного upstream |
+| `media.max.ru` | Blob/CDN-трафик отдельно от JSON | [\[6\]](#источники-3-6); upload/download не смешиваем с API |
+| `api.max.ru` | Stateless REST (dialogs, history, updates) | [\[6\]](#источники-3-6) — «everything else» JSON API |
+| `DC1`–`DC4` | Нумерация по **доле трафика** (40→15%), не по географии | [\[1\]](#источники-3-1) — группы ФО; DC1 = главный hub |
+| `GeoDNS` | DNS-based GSLB | [\[4\]](#источники-3-4), [\[5\]](#источники-3-5) — стандартный термин geo-routing |
+| `Virtual IP` | L4-балансировщик провайдера | [\[9\]](#источники-3-9) — Selectel Load Balancer |
+
 ### 3.1. Функциональное разбиение по доменам
 
 | Домен | Функции |
@@ -361,9 +373,15 @@ Media RPS upload peak: 3 472 × 4 = 13 889 RPS
 | `media.max.ru` | Загрузка и скачивание медиафайлов |
 | `api.max.ru` | Диалоги, история, обновления |
 
+> **Почему четыре поддомена, а не один `max.ru`:** У мессенджера разные профили нагрузки — SMS/auth (редко, но критично), WebSocket (долгие соединения), blob (Гбит/с), REST JSON (много мелких запросов). Разделение по доменам = независимое масштабирование и отдельные TLS/upstream-политики ([\[6\]](#источники-3-6)).
+
+> **Почему `auth`, `msg`, `media`, `api`:** Короткие англоязычные префиксы — industry-конвенция для edge-маршрутизации (как `api.`, `cdn.`, `ws.` у крупных сервисов). `msg` — messaging/real-time; `api` — всё stateless REST, что не auth и не media.
+
 Разделение по поддоменам позволяет независимо масштабировать CPU (`msg.`) и storage/CDN (`media.`) — декомпозиция highload-сервиса по функциональным границам ([\[6\]](#источники-3-6)).
 
 ### 3.2. Расположение датацентров
+
+> **Почему `DC1`–`DC4`, а не названия городов в DNS:** Внутренний код `DC1` = **главный hub** (40% трафика, fallback для остальных — §3.5). Нумерация по убыванию доли нагрузки, не «с запада на восток». В GeoDNS клиент видит IP, не имя `DC3`.
 
 | ДЦ | Город | Площадка / провайдер | Цель |
 |----|-------|---------------------|------|
@@ -431,22 +449,67 @@ GeoDNS решает задачу: ЦФО → DC1, СЗФО → DC2, Сибирь
 
 > **Почему TTL = 60 сек:** компромисс между скоростью failover и нагрузкой на DNS. Ниже 30 сек — рост query volume без пропорционального выигрыша ([\[5\]](#источники-3-5)); выше 60 сек — слишком долгое переключение при аварии.
 
-**Схема DNS-балансировки (текстовая):**
+Исходник диаграммы: [resources/global-balancing-diagram.md](resources/global-balancing-diagram.md)
+
+```mermaid
+flowchart TB
+    subgraph FO["Распределение клиентов по ФО (§1.4, §3.3)"]
+        R1["ЦФО + ПФО · 40%"]
+        R2["СЗФО · 25%"]
+        R3["УФО + СФО + ДВФО · 20%"]
+        R4["ЮФО + СКФО · 15%"]
+    end
+
+    DNS["GeoDNS<br/>Yandex Cloud DNS / NS1<br/>A-запись по GeoIP · TTL 60s<br/>health-check каждые 15s"]
+
+    subgraph DC1["DC1 · Москва · Selectel MSK · 176 555 peak RPS"]
+        VIP1["Virtual IP · L4 LB"]
+        L71["nginx L7 · N+1"]
+        SVC1["auth · msg · media · api.max.ru"]
+        VIP1 --> L71 --> SVC1
+    end
+
+    subgraph DC2["DC2 · СПб · Selectel SPB · 110 347 peak RPS"]
+        VIP2["Virtual IP · L4 LB"]
+        L72["nginx L7 · N+1"]
+        SVC2["auth · msg · media · api.max.ru"]
+        VIP2 --> L72 --> SVC2
+    end
+
+    subgraph DC3["DC3 · Новосибирск · Selectel NSK · 88 278 peak RPS"]
+        VIP3["Virtual IP · L4 LB"]
+        L73["nginx L7 · N+1"]
+        SVC3["auth · msg · media · api.max.ru"]
+        VIP3 --> L73 --> SVC3
+    end
+
+    subgraph DC4["DC4 · Ростов · Colocation · 66 208 peak RPS"]
+        VIP4["Virtual IP · L4 LB"]
+        L74["nginx L7 · N+1"]
+        SVC4["auth · msg · media · api.max.ru"]
+        VIP4 --> L74 --> SVC4
+    end
+
+    R1 --> DNS
+    R2 --> DNS
+    R3 --> DNS
+    R4 --> DNS
+
+    DNS -->|"GeoIP → DC1"| VIP1
+    DNS -->|"GeoIP → DC2"| VIP2
+    DNS -->|"GeoIP → DC3"| VIP3
+    DNS -->|"GeoIP → DC4"| VIP4
+
+    DC4 -.->|"failover DC4→DC1"| DC1
+    DC3 -.->|"failover DC3→DC1"| DC1
+    DC2 -.->|"failover DC2→DC1"| DC1
+    DC1 -.->|"failover DC1→DC2+3+4"| DC2
+```
+
+**Поток запроса (пример: пользователь в Новосибирске):**
 
 ```
-Пользователь (Новосибирск)
-       │
-       ▼
-GeoDNS (Yandex Cloud DNS / NS1 — geo-routing по IP)
-       │ A-запись: VIP DC3 Новосибирск
-       ▼
-L4-балансировщик DC3 (Selectel Load Balancer, Virtual IP)
-       │ распределение по L7-пулу
-       ▼
-nginx L7 (пул из 9–10 серверов, N+1)
-       │ TLS Termination + маршрутизация по домену
-       ▼
-userver-сервисы (auth, message, updates, ws-gateway...)
+Клиент (Новосибирск) → GeoDNS → A-запись VIP DC3 → L4 LB → nginx L7 (N+1) → userver-сервисы
 ```
 
 ### 3.6. Список литературы
@@ -495,7 +558,21 @@ userver-сервисы (auth, message, updates, ws-gateway...)
 
 **WebSocket Sticky Routing** — WebSocket это долгосрочное соединение (часы). Нельзя переключать пользователя между серверами на каждый запрос. nginx настраивается: `hash $remote_addr consistent` — все пакеты одного WS-соединения идут на один backend.
 
+**Откуда взяты имена компонентов** — краткая карта; подробнее в §4.1:
+
+| Имя | Паттерн | Источник / обоснование |
+|-----|---------|------------------------|
+| **L4** / **L7** | Уровни OSI модели | Стандартная терминология балансировщиков ([\[1\]](#источники-4-1), [\[2\]](#источники-4-2) — nginx как L7) |
+| **Virtual IP (VIP)** | Floating IP провайдера перед пулом | [\[9\]](#источники-3-9) — Selectel Load Balancer |
+| **ECMP** | Распределение TCP-потоков между L7-узлами | Equal-Cost Multi-Path — стандарт L4-слоя |
+| **N+1** | N рабочих + 1 hot standby | Классическая схема резервирования пула |
+| **nginx L7** | Reverse proxy + TLS termination | [\[1\]](#источники-4-1) — бенчмарк HTTPS CPS |
+| **ws-gateway** | WebSocket gateway за `msg.max.ru` | Industry-паттерн: отдельный сервис для long-lived WS |
+| **SSL Session Tickets** | RFC 5077 — resume TLS без полного handshake | Снижение CPU на reconnect ([\[1\]](#источники-4-1)) |
+
 ### 4.1. Механизм резервирования N+1
+
+> **Почему два слоя L4 + L7, а не только nginx:** L4 (VIP провайдера) принимает сырой TCP и раздаёт по L7 через ECMP — nginx не держит единственную точку отказа на входе. L7 нужен для TLS termination, маршрутизации по `Host:` (`auth.` / `msg.` / …) и sticky WS ([\[9\]](#источники-3-9)).
 
 **Два слоя балансировки внутри ДЦ:**
 
@@ -503,6 +580,53 @@ userver-сервисы (auth, message, updates, ws-gateway...)
 2. **L7-слой** — пул nginx. TLS termination, маршрутизация по доменам, sticky routing для WebSocket.
 
 **Схема N+1**: N серверов обслуживают трафик, 1 горячий резерв принимает нагрузку при падении любого из N.
+
+Исходник диаграммы: [resources/local-balancing-diagram.md](resources/local-balancing-diagram.md)
+
+```mermaid
+flowchart TD
+    C["Клиенты (мобильные / веб)"]
+
+    subgraph EDGE["Сетевой слой Edge внутри ДЦ"]
+        SW1["ToR Switch A"]
+        SW2["ToR Switch B"]
+        VIP["Virtual IP · L4 LB провайдера<br/>ECMP round-robin"]
+    end
+
+    subgraph L7["L7-пул nginx (пример DC1: N рабочих + 1 hot standby)"]
+        L7A["L7-1"]
+        L7B["L7-2"]
+        L7C["L7-3 … L7-N"]
+        L7R["L7-резерв · N+1"]
+    end
+
+    subgraph APP["Маршрутизация по поддоменам (§3.1)"]
+        AUTH["auth.max.ru<br/>SMS · сессии · JWT"]
+        MSG["msg.max.ru<br/>WebSocket · send/receive"]
+        MEDIA["media.max.ru<br/>upload / download blob"]
+        API["api.max.ru<br/>dialogs · history · updates"]
+    end
+
+    subgraph STORE["Stateful слой (тот же ДЦ)"]
+        DB[("PostgreSQL / Citus")]
+        REDIS[("Redis Cluster<br/>user_status")]
+    end
+
+    C --> SW1 & SW2
+    SW1 & SW2 --> VIP
+    VIP -->|"ECMP"| L7A & L7B & L7C
+    VIP -. "failover" .-> L7R
+
+    L7A & L7B & L7C --> AUTH
+    L7A & L7B & L7C --> MSG
+    L7A & L7B & L7C --> MEDIA
+    L7A & L7B & L7C --> API
+
+    AUTH --> DB
+    MSG --> DB & REDIS
+    API --> DB
+    MEDIA --> DB
+```
 
 ### 4.2. Расчёт количества L7-балансировщиков
 
