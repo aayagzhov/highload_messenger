@@ -607,11 +607,6 @@ flowchart TD
         API["api.max.ru<br/>dialogs · history · updates"]
     end
 
-    subgraph STORE["Stateful слой (тот же ДЦ)"]
-        DB[("PostgreSQL / Citus")]
-        REDIS[("Redis Cluster<br/>user_status")]
-    end
-
     C --> SW1 & SW2
     SW1 & SW2 --> VIP
     VIP -->|"ECMP"| L7A & L7B & L7C
@@ -621,11 +616,6 @@ flowchart TD
     L7A & L7B & L7C --> MSG
     L7A & L7B & L7C --> MEDIA
     L7A & L7B & L7C --> API
-
-    AUTH --> DB
-    MSG --> DB & REDIS
-    API --> DB
-    MEDIA --> DB
 ```
 
 ### 4.2. Расчёт количества L7-балансировщиков
@@ -1332,7 +1322,7 @@ User-centric: (общий координатор) + 6 воркеров (×RF=2 �
 > - Fan-out → [\[3\]](#источники-7-3) — Ctrl+F: *"Iris"*
 > - random_id → [\[6\]](#источники-7-6) — Ctrl+F: *"random_id"*
 
-**Таблица реализуемости на текущей схеме БД:**
+**Таблица реализуемости на текущей схеме:**
 
 | Алгоритм | Нужные поля | Есть в схеме? |
 |----------|------------|--------------|
@@ -1340,7 +1330,7 @@ User-centric: (общий координатор) + 6 воркеров (×RF=2 �
 | Delta Sync | `device_sync_state.last_update_seq_no`, `user_updates.update_seq_no` | Да |
 | Ordered Merge | `messages.seq_no`, `user_updates.update_seq_no` | Да |
 | Keepalive | Redis TTL для UserStatus | Да |
-| Reconnect storm | Клиентский код (Swift/Kotlin), не БД | Да |
+| Reconnect storm | Клиентский код (Swift/Kotlin) | Да |
 | **random_id** | `messages.client_random_id` (bigint, nullable) | Да |
 
 ### 7.1. Fan-out — как одно сообщение доходит до всех участников
